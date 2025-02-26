@@ -154,35 +154,68 @@ optimizer = optim.AdamW(mamba_lm.parameters(), lr=1e-4)
 criterion = nn.CrossEntropyLoss()
 
 ############################################
-# 6. 간단한 파인튜닝 루프 예시
+# 6. DataLoader로 미니배치 학습
 ############################################
-# (실제로는 DataLoader, 배치 처리, 여러 epoch 등 구현 필요)
-train_examples = []
+from torch.utils.data import Dataset, DataLoader
 
-for q, a in train_data:
-    # "[Q: ...] [SEP] [A: ...] [EOS]" 형식으로 하나의 문자열 구성
-    # 자유롭게 포맷 가능
-    text_sequence = f"Q: {q} [SEP] A: {a} [EOS]"
-    enc = tokenizer(text_sequence, return_tensors="pt", truncation=True, max_length=512)
-    train_examples.append(enc["input_ids"][0])  # [seq_len]
+class QADataset(Dataset):
+    """단순 (Q, A) 튜플 목록 -> 토큰 시퀀스 텐서"""
+    def __init__(self, pairs, tokenizer, max_length=512):
+        self.samples = []
+        self.tokenizer = tokenizer
+        self.max_length = max_length
 
-# 패딩, 배치 처리를 위해 간단한 예시로 전부 최대길이에 맞춰 pad
-max_length = max(x.size(0) for x in train_examples)
-padded_inputs = []
-for ids in train_examples:
-    pad_size = max_length - ids.size(0)
-    padded = torch.cat([ids, torch.full((pad_size,), tokenizer.pad_token_id)])
-    padded_inputs.append(padded.unsqueeze(0))
+        for q, a in pairs:
+            # "[Q: ...] [SEP] A: ... [EOS]" 형태로 문자열 구성
+            text_sequence = f"Q: {q} [SEP] A: {a} [EOS]"
+            enc = self.tokenizer(
+                text_sequence,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length
+            )
+            # enc["input_ids"] : shape [1, seq_len]
+            # squeeze로 [seq_len] 만듦
+            input_ids = enc["input_ids"].squeeze(0)
+            self.samples.append(input_ids)
 
-train_tensor = torch.cat(padded_inputs, dim=0).cuda()  # [N, max_length]
+    def __len__(self):
+        return len(self.samples)
 
-print("Train shape:", train_tensor.shape)  # (샘플 수, max_length)
+    def __getitem__(self, idx):
+        return self.samples[idx]
 
-# 간단히 1 에포크만 예시
-for step in range(10):  # 실제로는 수백~수천 스텝
-    loss_val = train_step(mamba_lm, train_tensor, optimizer, criterion)
-    if (step + 1) % 1 == 0:
-        print(f"Step {step+1}, loss={loss_val:.4f}")
+def collate_fn(batch):
+    """
+    batch: List of Tensors([seq_len]) with variable lengths
+    We will pad them to the max length in this batch.
+    """
+    max_len = max(x.size(0) for x in batch)
+    padded_batch = []
+    for x in batch:
+        pad_size = max_len - x.size(0)
+        padded = torch.cat([x, torch.full((pad_size,), tokenizer.pad_token_id, dtype=torch.long)])
+        padded_batch.append(padded.unsqueeze(0))
+    return torch.cat(padded_batch, dim=0)  # [batch_size, max_len_in_batch]
+
+# 데이터셋/데이터로더 생성
+train_dataset = QADataset(train_data, tokenizer, max_length=512)
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=8,      # 배치 사이즈
+    shuffle=True,
+    collate_fn=collate_fn
+)
+
+# 학습 루프 (에폭 X, 미니배치 Y)
+num_epochs = 2
+for epoch in range(num_epochs):
+    for step, input_ids in enumerate(train_loader):
+        input_ids = input_ids.cuda()  # [batch_size, seq_len]
+        loss_val = train_step(mamba_lm, input_ids, optimizer, criterion)
+
+        if (step + 1) % 100 == 0:
+            print(f"Epoch {epoch+1}, Step {step+1}, Loss={loss_val:.4f}")
 
 ############################################
 # 7. (선택) Mamba + LangChain 연동
@@ -190,29 +223,46 @@ for step in range(10):  # 실제로는 수백~수천 스텝
 # LangChain은 일반적으로 LLM(질문 + 컨텍스트 → 답변)을 호출해야 합니다.
 # Mamba는 HF pipeline 형태가 아니므로, 커스텀 LLM 클래스를 만들어 _call()에서 generate_text() 수행
 
+
 class MambaLLM(LLM):
-    def __init__(self, model: nn.Module, tokenizer, max_new_tokens=64):
-        super().__init__()
-        self.model = model
-        self.tokenizer = tokenizer
-        self.max_new_tokens = max_new_tokens
-        # eos_token_id 설정 가능
-        self.eos_token_id = tokenizer.sep_token_id  # 예시
+    # Optionally, you can declare a field for the model name or other metadata
+    # that Pydantic can store:
+    model_name: str = "Mamba"
+
+    def __init__(
+        self,
+        model: nn.Module,
+        tokenizer,
+        max_new_tokens: int = 64,
+        **kwargs
+    ):
+        """
+        model: Your MambaLanguageModel instance
+        tokenizer: The tokenizer (e.g., Hugging Face AutoTokenizer)
+        max_new_tokens: how many tokens to generate
+        """
+        super().__init__(**kwargs)  # hand all other kwargs to parent
+        self._model = model             # store it as a "private" attribute
+        self._tokenizer = tokenizer
+        self._max_new_tokens = max_new_tokens
+        self._eos_token_id = tokenizer.sep_token_id  # or define a real EOS if available
 
     @property
     def _llm_type(self) -> str:
         return "mamba_custom"
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
-        # prompt가 들어오면 Mamba 기반으로 텍스트를 생성
+        """Generate text from the Mamba model given a prompt."""
+        # Use your existing generate_text() but point to self._model & self._tokenizer
         output = generate_text(
-            model=self.model,
-            tokenizer=self.tokenizer,
+            model=self._model,
+            tokenizer=self._tokenizer,
             prompt=prompt,
-            max_new_tokens=self.max_new_tokens,
-            eos_token_id=self.eos_token_id
+            max_new_tokens=self._max_new_tokens,
+            eos_token_id=self._eos_token_id
         )
         return output
+
 
 # (1) 벡터스토어(RAG) 준비
 # 예: train_documents를 FAISS에 넣는다.
@@ -249,15 +299,15 @@ qa_chain = RetrievalQA.from_chain_type(
     llm=mamba_llm_wrapper,
     chain_type="stuff",
     retriever=retriever,
-    return_source_documents=True,
+    # return_source_documents=True,
     chain_type_kwargs={"prompt": my_prompt},
 )
 
-# (4) 테스트
-test_question = "크레인 작업 시 필요한 안전조치는?"
-result = qa_chain.run(test_question)
-print("질문:", test_question)
-print("모델 답변:", result)
+# # (4) 테스트
+# test_question = "크레인 작업 시 필요한 안전조치는?"
+# result = qa_chain.run(test_question)
+# print("질문:", test_question)
+# print("모델 답변:", result)
 
 
 ############################################
