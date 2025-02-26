@@ -37,11 +37,11 @@ train["사고객체(중분류)"] = train["사고객체"].str.split(" > ").str[1]
 train_data = []
 for _, row in train.iterrows():
     q = (
-        f"공사종류 대분류 '{row['공사종류(대분류)']}', "
-        f"중분류 '{row['공사종류(중분류)']}' 공사 중 "
-        f"공종 대분류 '{row['공종(대분류)']}', "
+        # f"공사종류 대분류 '{row['공사종류(대분류)']}', "
+        # f"중분류 '{row['공사종류(중분류)']}' 공사 중 "
+        # f"공종 대분류 '{row['공종(대분류)']}', "
         f"중분류 '{row['공종(중분류)']}' 작업에서 "
-        f"사고객체 '{row['사고객체(대분류)']}'(중분류: '{row['사고객체(중분류)']}')와 관련된 사고가 발생했습니다. "
+        f"사고객체 '{row['사고객체(대분류)']}' 와 관련된 사고가 발생했습니다. "
         f"작업 프로세스는 '{row['작업프로세스']}'이며, "
         f"사고 원인은 '{row['사고원인']}'입니다. 재발 방지 대책 및 향후 조치 계획은 무엇인가요?"
     )
@@ -163,7 +163,7 @@ for q, a in train_data:
     # "[Q: ...] [SEP] [A: ...] [EOS]" 형식으로 하나의 문자열 구성
     # 자유롭게 포맷 가능
     text_sequence = f"Q: {q} [SEP] A: {a} [EOS]"
-    enc = tokenizer(text_sequence, return_tensors="pt")
+    enc = tokenizer(text_sequence, return_tensors="pt", truncation=True, max_length=512)
     train_examples.append(enc["input_ids"][0])  # [seq_len]
 
 # 패딩, 배치 처리를 위해 간단한 예시로 전부 최대길이에 맞춰 pad
